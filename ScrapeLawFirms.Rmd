@@ -1,0 +1,247 @@
+---
+title: "Untitled"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(cache = TRUE, echo = FALSE, message = FALSE, warning = FALSE, include = FALSE,
+                      #dpi = 500
+                      dev = "cairo_pdf"
+                      ,root.dir = getwd())
+
+rm(list = ls()) #start with empty workspace
+
+library(tidyverse)
+
+library(rvest)
+library(data.table)
+library(RSelenium)
+library(XML)
+
+options(scipen = 999)
+
+rm(list = ls()) #start with empty workspace
+
+dsrFolder <- "~/GitHub/ScrapeLawFirms/"
+
+ifelse(
+  !dir.exists(file.path(dsrFolder))
+  , dir.create(file.path(dsrFolder))
+  , FALSE)
+
+setwd(dsrFolder)
+
+```
+
+```{r getdata, eval = FALSE}
+
+system("taskkill /im java.exe /f", intern=FALSE, ignore.stdout=FALSE)
+
+rD <- rsDriver(browser = "chrome"
+               ,verbose = TRUE
+               ,port = 4565L
+               ,chromever = "94.0.4606.61" )
+
+remDr <- rD[["client"]]
+
+remDr$navigate("https://members.calbar.ca.gov/search/ls_search.aspx")
+
+if( exists("rD")) {
+  
+  geoDropDownOptions <- XML::htmlParse(remDr$getPageSource()[[1]]) %>%
+    xmlRoot(.) %>% 
+    getNodeSet('//*[(@id = "ctl00_PageContent_ddlCounty")]/option')
+  
+  geoDropDownOptions <- data.frame(geoID = sapply(geoDropDownOptions, xmlGetAttr, "value")
+                                   ,geoName = sapply(geoDropDownOptions, xmlValue))
+  
+  specialityDropDownOptions <- XML::htmlParse(remDr$getPageSource()[[1]]) %>%
+    xmlRoot(.) %>% 
+    getNodeSet('//*[@id="ctl00_PageContent_ddlSpecialty"]/option')
+  
+  specialityDropDownOptions <- data.frame(spcltyID = sapply(specialityDropDownOptions, xmlGetAttr, "value")
+                                          ,spcltyName = sapply(specialityDropDownOptions, xmlValue))
+  
+  
+  comboDropdowns <- geoDropDownOptions %>% 
+    mutate(tmp = 1) %>% 
+    full_join(specialityDropDownOptions %>% mutate(tmp = 1)) 
+  
+  startTime <- Sys.time()
+  
+  tmp_ <- list()
+  
+  for(i in seq_along(comboDropdowns$geoName)){
+    
+    print(paste0(i, " of "
+                 ,length(comboDropdowns$geoName)
+                 ," - "
+                 ,comboDropdowns$geoName[i]
+                 ," - "
+                 ,comboDropdowns$spcltyName[i])
+    )
+    
+    option <- remDr$findElement(using = 'xpath'
+                                , paste0("//*[(@id = 'ctl00_PageContent_ddlSpecialty')]/option[@value ='"
+                                         ,comboDropdowns$spcltyID[i]
+                                         ,"']"  ) )
+    
+    option$clickElement()
+    
+    option <- remDr$findElement(using = 'xpath'
+                                , paste0("//*[(@id = 'ctl00_PageContent_ddlCounty')]/option[@value ='"
+                                         ,comboDropdowns$geoID[i]
+                                         ,"']"  ) )
+    
+    option$clickElement()
+    
+    Sys.sleep(1)
+    
+    option <- remDr$findElement(using = 'xpath'
+                                , '//*[@id="ctl00_PageContent_btnSubmit"]') 
+    option$clickElement()
+    
+    Sys.sleep(1)
+    webElem <- remDr$findElement("css", "body")
+    webElem$sendKeysToElement(list(key = "end"))
+    Sys.sleep(1)
+    tmp_[[i]] <- XML::htmlParse(remDr$getPageSource()[[1]]) %>% 
+      XML::xpathSApply(., "//a/@href") %>% 
+      tibble::enframe(name = NULL) %>% 
+      filter(grepl("Member", value)) %>% 
+      mutate(county = comboDropdowns$geoName[i],
+             specialty = comboDropdowns$spcltyName[i])
+
+    remDr$goBack()
+
+  }
+  
+  tmp_ %>% 
+    data.table::rbindlist(fill = TRUE, idcol = "id") %>% 
+    saveRDS( "links_dat.rds")
+  Sys.time()-startTime %>% print # Time difference of 1.339176 hours
+}
+
+```
+
+```{r getAddressDelts, eval = FALSE}
+
+links <- readRDS( "links_dat.rds") %>% 
+  distinct(value, .keep_all = TRUE)
+
+system("taskkill /im java.exe /f", intern=FALSE, ignore.stdout=FALSE)
+
+rD <- rsDriver(browser = "chrome"
+               ,verbose = TRUE
+               ,port = 4565L
+               ,chromever = "94.0.4606.61" )
+
+remDr <- rD[["client"]]
+
+remDr$navigate("https://members.calbar.ca.gov/search/ls_search.aspx")
+
+# links %>% sample_n(6) -> links
+
+startTime <- Sys.time()
+
+addrs_ <- list()
+lcns_stat_ <- list()
+
+for(i in seq_along(links$id)){
+  
+  print(paste0(i, " of "
+               ,length(links$id)
+               ," - "
+               # ,comboDropdowns$geoName[i]
+               # ," - "
+               # ,comboDropdowns$spcltyName[i])
+  ))
+  
+  remDr$navigate( paste0("http://members.calbar.ca.gov", links$value[i]))
+  Sys.sleep(3)
+  
+  result <- try(
+    
+    webPageInfo <- read_html(remDr$getPageSource()[[1]])
+    
+  )
+  
+  if(grepl("Application Not Available", result)) {
+    
+    print("skipped") 
+    next
+    
+  }
+  
+  addr <- webPageInfo %>% 
+    html_nodes(xpath='//*[@id="moduleMemberDetail"]/div[3]/p[1]') %>%
+    html_text() %>% 
+    gsub( "[^[:alnum:] ,;]","",.) %>% 
+    enframe() %>% 
+    select(AttorneyAddress = 2) 
+
+  addr <- if ( nrow(addr) == 0 ) {
+    data.frame(AttorneyAddress = "NoAddress")
+  } else if ( row(addr) != 0 ){
+    addr
+  } else {
+    "NA"
+  }
+  
+  att_Name <- webPageInfo %>% 
+    html_nodes(xpath='/html/body/div[1]/div/div/div[3]/div[2]/div[2]/div/div[2]/h3/b') %>%
+    html_text() %>% 
+    gsub( "[^[:alnum:] ,;]","",.) %>% 
+    enframe() %>% 
+    select(AttorneyName = 2)
+  
+  att_Name <- if ( nrow(att_Name) == 0 ) {
+    data.frame(AttorneyAddress = "NoAddress")
+  } else if (row(att_Name) != 0){
+    att_Name
+  } else {
+    "NA"
+  }
+  
+  addrs_[[i]] <- addr  %>% 
+    bind_cols(   att_Name ) %>% 
+    mutate(value = links$value[i])
+
+  result <- try(
+    
+    licStat <- readHTMLTable(remDr$getPageSource()[[1]]) %>% 
+      .[[1]] %>% 
+      setNames(gsub("[^[:alnum:]]", perl = TRUE, "", names(.))) %>% 
+      setNames(gsub("NULL", perl = TRUE, "", names(.))) %>% 
+      mutate(across(where(is.character), ~ gsub( "[^[:alnum:] ,;\\/]","",.))) %>% 
+      mutate(value = links$value[i])
+    
+  )
+  
+  if(grepl("subscript out of bounds", result)) {
+    
+    # print("skipped") 
+    # next
+    licStat <- data.frame(Date = NA,
+                          LicenseStatusÂ = NA)
+    
+  }
+  
+  lcns_stat_[[i]] <- licStat
+  
+}
+
+addrs_ %>% 
+  data.table::rbindlist(fill = TRUE, idcol = "id") %>% 
+  saveRDS( "addrs.rds")
+
+lcns_stat_ %>% 
+  data.table::rbindlist(fill = TRUE, idcol = "id") %>% 
+  saveRDS( "lcns_stat.rds")
+
+Sys.time()-startTime %>% print # ime difference of 6.274889 hours
+
+```
+
+
